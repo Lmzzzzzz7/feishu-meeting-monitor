@@ -1,267 +1,336 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-飞书会议监控系统 - 主程序
-搜索会议纪要 -> 读取内容 -> AI分析 -> 生成报告
+飞书会议监控系统 V2 - 基于 lark-cli
+搜索 → 读取 → AI分析 → 生成日报/周报 → 发群
 """
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 import time
-import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from config import get_config, Config
+from dotenv import load_dotenv
 
-# ========== 飞书 API ==========
+# ========== 配置 ==========
 
-def get_tenant_access_token(app_id: str, app_secret: str) -> str:
-    """获取应用 tenant_access_token"""
-    url = f"{Config.FEISHU_API_BASE}/auth/v3/tenant_access_token/internal"
-    data = {"app_id": app_id, "app_secret": app_secret}
-    response = requests.post(url, json=data)
-    result = response.json()
-    return result.get("tenant_access_token", "")
+load_dotenv(Path(__file__).parent / ".env")
 
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "")
+SEARCH_PREFIX = os.getenv("SEARCH_PREFIX", "文字记录：")
+MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+MODEL_TEMP = float(os.getenv("DEEPSEEK_TEMP", "0.3"))
 
-def refresh_access_token(app_id: str, app_secret: str, refresh_token: str) -> dict:
-    """刷新用户 access_token"""
-    url = f"{Config.FEISHU_API_BASE}/authen/v1/refresh_access_token"
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }
-    headers = {
-        "Authorization": f"Bearer {get_tenant_access_token(app_id, app_secret)}"
-    }
-    response = requests.post(url, headers=headers, json=data)
-    return response.json()
+# ========== lark-cli 封装 ==========
 
-
-def search_documents(token: str, query: str = "a", page_size: int = 50) -> list:
-    """搜索文档"""
-    url = f"{Config.FEISHU_API_BASE}/search/v2/doc_wiki/search"
-    headers = {"Authorization": f"Bearer {token}"}
-    data = {
-        "query": query,
-        "wiki_filter": {"doc_types": ["DOCX", "DOC"]},
-        "page_size": page_size,
-        "sort_type": "CREATE_TIME"
-    }
-    response = requests.post(url, headers=headers, json=data)
-    result = response.json()
-    return result.get("data", {}).get("res_units", [])
+def run_cli(cmd: list[str], timeout: int = 20) -> str:
+    """运行 lark-cli 命令，返回 stdout"""
+    result = subprocess.run(
+        ["lark-cli"] + cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=Path(__file__).parent
+    )
+    if result.returncode != 0 and result.stderr:
+        print(f"    ⚠️ CLI 警告: {result.stderr[:200]}")
+    return result.stdout
 
 
-def read_document_content(tenant_token: str, doc_token: str) -> str:
-    """读取文档内容"""
-    url = f"{Config.FEISHU_API_BASE}/docx/v1/documents/{doc_token}/blocks"
-    headers = {"Authorization": f"Bearer {tenant_token}"}
-    params = {"page_size": 100}
-
-    all_text = []
-    while url:
-        response = requests.get(url, headers=headers, params=params)
-        data = response.json().get("data", {})
-
-        for block in data.get("items", []):
-            text = extract_block_text(block)
-            if text:
-                all_text.append(text)
-
-        # 分页
-        page_token = data.get("page_token")
-        if page_token:
-            params["page_token"] = page_token
-        else:
-            break
-
-    return "\n".join(all_text[:100])  # 限制长度
-
-
-def extract_block_text(block: dict) -> str:
-    """从 block 中提取文本"""
-    block_type = block.get("block_type")
-    text = ""
-
-    if block_type == 2:  # text
-        elements = block.get("text", {}).get("elements", [])
-        for elem in elements:
-            text += elem.get("text_run", {}).get("content", "")
-
-    elif block_type in [1, 3, 4]:  # heading1, heading2, heading3
-        heading = block.get("heading1") or block.get("heading2") or block.get("heading3")
-        if heading:
-            for elem in heading.get("elements", []):
-                text += elem.get("text_run", {}).get("content", "")
-
-    elif block_type == 12:  # bullet
-        for elem in block.get("bullet", {}).get("elements", []):
-            text += elem.get("text_run", {}).get("content", "")
-
-    return text.strip()
-
-
-# ========== DeepSeek API ==========
-
-def analyze_with_deepseek(text: str, api_key: str) -> dict:
-    """用 DeepSeek 分析会议内容"""
-    url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-
-    prompt = """你是一个会议分析助手。请分析以下会议纪要，提取：
-1. 会议主题
-2. 关键决策（不超过3条）
-3. 风险问题（不超过3条）
-4. 待办事项（包含负责人）
-5. 涉及的项目名称
-
-请用 JSON 格式输出：
-{
-    "主题": "...",
-    "关键决策": ["...", "..."],
-    "风险问题": ["...", "..."],
-    "待办事项": [{"任务": "...", "负责人": "..."}],
-    "涉及项目": ["...", "..."]
-}"""
-
-    data = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": text[:8000]}
-        ]
-    }
-
-    response = requests.post(url, headers=headers, json=data, timeout=30)
-    result = response.json()
-
+def search_docs(query: str = SEARCH_PREFIX, limit: int = 20) -> list[dict]:
+    """搜索文档，返回 [{token, title, create_time_iso}]"""
+    output = run_cli([
+        "docs", "+search",
+        "--query", query,
+        "--page-size", str(limit),
+        "--format", "json"
+    ])
     try:
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        # 尝试解析 JSON
-        return json.loads(content)
-    except:
-        return {"error": "解析失败", "raw": content}
+        data = json.loads(output)
+        results = data.get("data", {}).get("results", [])
+        return [
+            {
+                "token": r.get("result_meta", {}).get("token", ""),
+                "title": r.get("title_highlighted", "").replace("<h>", "").replace("</h>", ""),
+                "create_time": r.get("result_meta", {}).get("create_time", 0),
+                "create_time_iso": r.get("result_meta", {}).get("create_time_iso", ""),
+                "url": r.get("result_meta", {}).get("url", ""),
+            }
+            for r in results
+            if r.get("result_meta", {}).get("token")
+        ]
+    except Exception as e:
+        print(f"    ⚠️ 搜索解析失败: {e}")
+        return []
+
+
+def fetch_doc(token: str, limit: int = 8000) -> str:
+    """读取文档内容，返回 markdown 文本"""
+    output = run_cli([
+        "docs", "+fetch",
+        "--doc", token,
+        "--limit", str(limit),
+        "--format", "json"
+    ])
+    try:
+        data = json.loads(output)
+        text = data.get("data", {}).get("markdown", "")
+        # 清理控制字符
+        text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text)
+        return text
+    except Exception as e:
+        print(f"    ⚠️ 文档读取失败: {e}")
+        return ""
+
+
+# ========== DeepSeek AI 分析 ==========
+
+def analyze_with_deepseek(content: str, prompt: str) -> str:
+    """调用 DeepSeek 分析文本内容"""
+    import requests
+
+    resp = requests.post(
+        "https://api.deepseek.com/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
+        },
+        json={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": content[:12000]}
+            ],
+            "temperature": MODEL_TEMP
+        },
+        timeout=60
+    )
+    result = resp.json()
+    return result.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
+# ========== 日报生成 Prompt ==========
+
+DAILY_PROMPT = """你是一个会议日报助手。根据会议录音转写文本，生成一份结构清晰的日报。
+
+格式要求：
+## 会议概览
+- 会议主题：...
+- 会议时间：...
+- 参与人：（从文本中提取发言人）
+
+## 会议摘要
+2-3句话概括会议核心内容。
+
+## 关键决策
+列出明确的决策结论，每条一行。
+
+## 待办事项
+每条：- [任务描述] （负责人，如未明确则标注"待确认"）
+
+## 讨论要点
+列出主要讨论议题，每条一句话概括核心结论。
+
+## 风险与疑虑
+列出未解决的问题或担忧。
+
+要求：
+- 语言中文，语气正式，适合团队共享
+- 不逐字转写，要提炼整理
+- 信息不足处标注"未明确"，不编造"""
+
+WEEKLY_PROMPT = """你是一个会议周报助手。老板需要通过周报快速了解团队上周的工作进展和动态。
+
+请根据以下多篇会议录音文本，生成一份精炼的周报。
+
+格式要求：
+## 本周会议概览
+列出本周所有会议主题、时间、参会人。
+
+## 本周关键决策
+列出明确的决策结论，每条一行，带简要背景。
+
+## 本周待办事项
+每条：- [任务描述] （负责人，如未明确则标注"待确认"）
+
+## 重要讨论与进展
+按主题分条目，每条一句话概括核心讨论结论。
+
+## 风险与待解决问题
+列出悬而未决的问题或需要关注的风险。
+
+## 下周关注点
+列出下周需要重点跟进的1-3件事。
+
+要求：
+- 老板视角：简洁、有决策价值、不废话
+- 不逐字转写，要提炼和整合
+- 信息不足处标注"未明确"，不编造
+- 中文输出，语气专业"""
 
 
 # ========== 主流程 ==========
 
-def search_and_filter(config: Config) -> list:
-    """搜索文档并筛选"""
-    print("\n[1] 搜索文档...")
-
-    # 尝试用用户 token 搜索
-    docs = search_documents(config.USER_ACCESS_TOKEN, config.SEARCH_QUERY)
-    total = len(docs)
-    print(f"    搜索到 {total} 个文档")
-
-    if not docs:
-        print("    ⚠️ 未找到文档，可能 token 已过期")
-        return []
-
-    print("\n[2] 筛选「文字记录：」开头的文档...")
+def get_docs_by_date(days: int = 0, weekday_only: bool = True) -> list[dict]:
+    """获取指定日期范围的文档"""
+    docs = search_docs(limit=50)
+    
     filtered = []
-    for item in docs:
-        title = re.sub(r'<[^>]+>', '', item.get('title_highlighted', ''))
-        if title.startswith(config.SEARCH_PREFIX):
-            meta = item.get('result_meta', {})
-            filtered.append({
-                'title': title,
-                'token': meta.get('token', ''),
-                'create_time': meta.get('create_time', 0),
-                'url': meta.get('url', '')
-            })
-
-    print(f"    筛选出 {len(filtered)} 个文档")
-
-    for i, doc in enumerate(filtered[:5], 1):
-        date = datetime.fromtimestamp(doc['create_time']).strftime('%Y-%m-%d')
-        print(f"    {i}. [{date}] {doc['title']}")
-
+    now = datetime.now()
+    
+    for doc in docs:
+        if not doc.get("token"):
+            continue
+        if SEARCH_PREFIX and not doc["title"].startswith(SEARCH_PREFIX):
+            continue
+        
+        if days == 0:
+            # 当天
+            doc_date = datetime.fromtimestamp(doc["create_time"]) if doc["create_time"] else None
+            if doc_date and doc_date.date() == now.date():
+                filtered.append(doc)
+        else:
+            # 最近 N 天
+            doc_date = datetime.fromtimestamp(doc["create_time"]) if doc["create_time"] else None
+            if doc_date:
+                days_ago = (now - doc_date).days
+                in_range = days_ago <= days
+                is_weekday = doc_date.weekday() < 5 if weekday_only else True
+                if in_range and is_weekday:
+                    filtered.append(doc)
+    
     return filtered
 
 
-def analyze_documents(filtered_docs: list, config: Config):
-    """分析文档"""
-    if not filtered_docs:
-        print("\n⚠️ 没有文档可分析")
-        return
-
-    print("\n[3] 读取文档内容并分析...")
-
-    # 获取 tenant token 用于读取文档
-    tenant_token = get_tenant_access_token(config.APP_ID, config.APP_SECRET)
-
-    results = []
-    for i, doc in enumerate(filtered_docs[:3], 1):  # 只分析前3个
-        print(f"    分析 {i}/{min(3, len(filtered_docs))}: {doc['title'][:30]}...")
-
-        # 读取内容
-        content = read_document_content(tenant_token, doc['token'])
-        if not content:
-            print(f"    ⚠️ 无法读取文档内容")
-            continue
-
-        # AI 分析
-        analysis = analyze_with_deepseek(content, config.DEEPSEEK_API_KEY)
-        analysis['document_title'] = doc['title']
-        analysis['document_url'] = doc['url']
-        results.append(analysis)
-
-        time.sleep(1)  # 避免 API 限流
-
-    print(f"\n    完成 {len(results)} 个文档的分析")
-
-    # 输出结果
-    print("\n" + "=" * 50)
-    print("分析结果")
-    print("=" * 50)
-    for r in results:
-        print(f"\n📄 {r.get('document_title', 'N/A')}")
-        print(json.dumps(r, ensure_ascii=False, indent=2))
-
-    return results
+def send_to_chat(message: str):
+    """发送消息到飞书群"""
+    if not TARGET_CHAT_ID:
+        print("    ⚠️ 未配置 TARGET_CHAT_ID，跳过发送")
+        return False
+    
+    output = run_cli([
+        "im", "+messages-send",
+        "--chat-id", TARGET_CHAT_ID,
+        "--text", message,
+        "--as", "bot",
+        "--format", "json"
+    ], timeout=15)
+    
+    try:
+        data = json.loads(output)
+        if data.get("ok"):
+            print("    ✅ 消息已发送")
+            return True
+        else:
+            print(f"    ⚠️ 发送失败: {data.get('error', {}).get('message', output[:200])}")
+            return False
+    except:
+        print(f"    ⚠️ 发送结果解析失败: {output[:200]}")
+        return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="飞书会议监控系统")
-    parser.add_argument("--search", action="store_true", help="仅搜索和筛选")
-    parser.add_argument("--analyze", action="store_true", help="仅分析")
-    parser.add_argument("--all", action="store_true", help="完整流程")
+    parser = argparse.ArgumentParser(description="飞书会议监控系统 V2")
+    parser.add_argument("--today", action="store_true", help="分析当天会议，生成日报")
+    parser.add_argument("--week", action="store_true", help="分析上周所有会议，生成周报")
+    parser.add_argument("--analyze", metavar="TOKEN", help="分析指定文档 token")
+    parser.add_argument("--send", action="store_true", help="生成后发送到飞书群")
+    parser.add_argument("--quiet", action="store_true", help="静默模式，减少输出")
     args = parser.parse_args()
 
-    # 加载配置
-    config = get_config()
-    if not config.validate():
+    if not DEEPSEEK_API_KEY:
+        print("❌ 未配置 DEEPSEEK_API_KEY")
         sys.exit(1)
 
-    # 检查是否需要刷新 token
-    if config.REFRESH_TOKEN and not config.USER_ACCESS_TOKEN:
-        print("\n[0] 尝试刷新 token...")
-        result = refresh_access_token(config.APP_ID, config.APP_SECRET, config.REFRESH_TOKEN)
-        if result.get("code") == 0:
-            new_token = result.get("data", {}).get("access_token")
-            new_refresh = result.get("data", {}).get("refresh_token")
-            config.save_token(new_token, new_refresh)
-            config.USER_ACCESS_TOKEN = new_token
-            print("    ✅ Token 刷新成功")
-        else:
-            print(f"    ⚠️ Token 刷新失败: {result.get('msg')}")
+    log = lambda x: print(x) if not args.quiet else None
 
-    # 执行
-    if args.search or args.all:
-        filtered = search_and_filter(config)
-        if args.search:
+    # 分析指定文档
+    if args.analyze:
+        log(f"\n[1] 读取文档: {args.analyze}")
+        content = fetch_doc(args.analyze)
+        if not content:
+            print("❌ 文档内容为空")
+            sys.exit(1)
+        log(f"    已读取 {len(content)} 字符")
+        log("\n[2] AI 分析中...")
+        result = analyze_with_deepseek(content, DAILY_PROMPT)
+        print(f"\n{result}")
+        if args.send:
+            send_to_chat(result)
+        return
+
+    # 日报（当天）
+    if args.today:
+        log("\n📋 生成日报...")
+        docs = get_docs_by_date(days=0)
+        log(f"    找到 {len(docs)} 篇当天文档")
+        
+        if not docs:
+            print("⚠️ 当天没有会议记录")
             return
 
-    if args.analyze or args.all:
-        analyze_documents(filtered if 'filtered' in dir() else [], config)
+        # 读取所有文档
+        all_content = ""
+        for i, doc in enumerate(docs, 1):
+            log(f"    [{i}/{len(docs)}] 读取: {doc['title'][:30]}...")
+            content = fetch_doc(doc["token"])
+            if content:
+                all_content += f"\n\n--- 会议{i} ---\n{content[:6000]}"
+            time.sleep(1)
+
+        log("\n[2] AI 分析中...")
+        result = analyze_with_deepseek(all_content, DAILY_PROMPT)
+        
+        log("\n[3] 输出结果")
+        print(f"\n{'='*60}\n{result}\n{'='*60}")
+        
+        if args.send:
+            send_to_chat(result)
+        return
+
+    # 周报（上周）
+    if args.week:
+        log("\n📊 生成周报...")
+        today = datetime.now()
+        # 上周：7-13天前的工作日
+        docs = get_docs_by_date(days=7 + (today.weekday() + 6) % 7)
+        # 过滤只保留上周（7-13天前）
+        week_ago = today - timedelta(days=13)
+        docs = [d for d in docs if datetime.fromtimestamp(d["create_time"]) >= week_ago]
+        log(f"    找到 {len(docs)} 篇上周文档")
+
+        if not docs:
+            print("⚠️ 上周没有会议记录")
+            return
+
+        all_content = ""
+        for i, doc in enumerate(docs, 1):
+            log(f"    [{i}/{len(docs)}] 读取: {doc['title'][:30]}...")
+            content = fetch_doc(doc["token"])
+            if content:
+                all_content += f"\n\n--- 会议{i} ---\n{content[:6000]}"
+            time.sleep(1)
+
+        log("\n[2] AI 分析中...")
+        result = analyze_with_deepseek(all_content, WEEKLY_PROMPT)
+        
+        log("\n[3] 输出结果")
+        print(f"\n{'='*60}\n{result}\n{'='*60}")
+        
+        if args.send:
+            send_to_chat(result)
+        return
+
+    # 无参数，显示帮助
+    parser.print_help()
 
 
 if __name__ == "__main__":

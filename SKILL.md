@@ -1,112 +1,69 @@
 # feishu-meeting-monitor
 
-飞书会议纪要监控系统。自动搜索会议纪要文档，调用 AI 分析，生成结构化报告。
+飞书会议监控系统 V2。基于 `lark-cli` 实现。
 
 ## 功能
 
-- 自动搜索「文字记录：」开头的会议纪要文档
+- 自动搜索「文字记录：」开头的会议录音文档
 - 读取文档内容
-- 调用 AI（DeepSeek）分析会议要点
-- 生成结构化报告（主题、决策、风险、待办、负责人）
-- 支持 refresh_token 自动刷新
+- 调用 DeepSeek AI 分析会议要点
+- 生成结构化日报/周报
+- 支持日报发送到飞书群
+
+## 前提条件
+
+1. **lark-cli 安装**：`npm install -g @larksuite/cli`
+2. **飞书应用权限**（需管理员审批）：
+   - `search:docs:read` — 搜索文档（用户身份）
+   - `docx:document:readonly` — 读取文档（用户身份）
+   - `offline_access` — 持续访问 token
+   - `im:message:send_as_bot` — 发消息（Bot身份，已有）
+3. **lark-cli 登录**：`lark-cli auth login --scope "search:docs:read docx:document:readonly offline_access"`
+4. **DeepSeek API Key**
 
 ## 使用方法
 
-### 1. 配置
+```bash
+# 配置
+cp .env.example .env
+# 编辑 .env 填入实际值
 
-在项目根目录创建 `.env` 文件：
+# 日报（当天）
+python main.py --today
+
+# 周报（上周）
+python main.py --week
+
+# 分析指定文档
+python main.py --analyze <token>
+
+# 生成并发送日报
+python main.py --today --send
+```
+
+## 定时任务
 
 ```bash
-# 飞书应用凭证
-FEISHU_APP_ID=cli_xxxxxxxxxxxxx
-FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
-
-# 用户 OAuth（首次需要手动获取，后续可自动刷新）
-# 参考下方"获取 Token"步骤
-FEISHU_USER_ACCESS_TOKEN=
-FEISHU_REFRESH_TOKEN=
-
-# DeepSeek API
-DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx
+# 每日早9点运行
+0 9 * * 1-5 cd /path/to/feishu-meeting-monitor && python main.py --today --quiet
 ```
-
-### 2. 获取 Token（首次）
-
-1. 打开浏览器访问：
-```
-https://open.feishu.cn/open-apis/authen/v1/authorize?app_id=你的APP_ID&redirect_uri=https://open.feishu.cn/&scope=offline_access
-```
-
-2. 授权后，浏览器会跳转到类似：
-```
-https://open.feishu.cn/?code=xxxxx&state=xxx
-```
-
-3. 用 code 换取 token：
-```bash
-curl -X POST "https://open.feishu.cn/open-apis/authen/v1/access_token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "grant_type": "authorization_code",
-    "client_id": "你的APP_ID",
-    "client_secret": "你的APP_SECRET",
-    "code": "刚才拿到的code"
-  }'
-```
-
-4. 把返回的 `access_token` 和 `refresh_token` 填入 `.env`
-
-### 3. 运行
-
-```bash
-python main.py --search    # 搜索并筛选文档
-python main.py --analyze  # 分析文档并生成报告
-python main.py --all      # 完整流程：搜索+分析+报告
-```
-
-### 4. 定时任务（可选）
-
-配合 cron 实现每日自动运行。
 
 ## 配置项
 
-| 变量 | 必填 | 说明 |
-|-----|-----|------|
-| FEISHU_APP_ID | ✅ | 飞书应用 App ID |
-| FEISHU_APP_SECRET | ✅ | 飞书应用 App Secret |
-| FEISHU_USER_ACCESS_TOKEN | ✅ | 用户 access_token |
-| FEISHU_REFRESH_TOKEN | ✅ | 用于自动刷新 |
-| DEEPSEEK_API_KEY | ✅ | DeepSeek API Key |
+| 变量 | 说明 |
+|-----|------|
+| FEISHU_APP_ID | 飞书应用 App ID |
+| FEISHU_APP_SECRET | 飞书应用 App Secret |
+| DEEPSEEK_API_KEY | DeepSeek API Key |
+| TARGET_CHAT_ID | 发消息的目标群 ID |
+| SEARCH_PREFIX | 文档标题前缀（默认：文字记录：） |
 
-## 输出示例
-
-```json
-{
-  "主题": "一站式Agent平台线上周会",
-  "关键决策": [
-    "工具调用决策：大模型自主决定",
-    "环境隔离决策：区分测试和生产环境"
-  ],
-  "风险问题": [
-    "工具膨胀风险",
-    "环境连接问题"
-  ],
-  "待办事项": [
-    {"任务": "知识库产品设计收尾", "负责人": "张雅欣"},
-    {"任务": "沙箱产品层设计", "负责人": "尹思源"}
-  ],
-  "涉及项目": ["知识库", "沙箱", "MCP", "SDK"]
-}
-```
-
-## 文件结构
+## 输出格式
 
 ```
-feishu-meeting-monitor/
-├── SKILL.md           # 本文件
-├── main.py            # 主程序
-├── config.py          # 配置加载
-├── .env.example       # 配置示例
-├── requirements.txt   # 依赖
-└── README.md         # 详细说明
+## 会议概览
+## 关键决策
+## 待办事项
+## 讨论要点
+## 风险与疑虑
 ```
