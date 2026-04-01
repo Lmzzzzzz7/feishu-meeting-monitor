@@ -378,11 +378,17 @@ def main():
     if args.week:
         log("\n📊 生成周报...")
         today = datetime.now()
-        # 上周：7-13天前的工作日
-        docs = get_docs_by_date(days=7 + (today.weekday() + 6) % 7)
-        # 过滤只保留上周（7-13天前）
-        week_ago = today - timedelta(days=13)
-        docs = [d for d in docs if datetime.fromtimestamp(d["create_time"]) >= week_ago]
+        
+        # 计算上周范围：上周一到周日
+        # 当前是周三(weekday=2)，上周一是 today - 7 - 2 = 5天前
+        days_since_monday = today.weekday()
+        last_monday = today - timedelta(days=days_since_monday + 7)
+        last_sunday = last_monday + timedelta(days=6)
+        
+        docs = get_docs_by_date(days=days_since_monday + 7)
+        # 过滤只保留上周（周一到周日）
+        docs = [d for d in docs if last_monday.date() <= datetime.fromtimestamp(d["create_time"]).date() <= last_sunday.date()]
+        log(f"    上周范围：{last_monday.strftime('%m/%d')} - {last_sunday.strftime('%m/%d')}")
         log(f"    找到 {len(docs)} 篇上周文档")
 
         if not docs:
